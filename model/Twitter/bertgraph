@@ -1,0 +1,214 @@
+# -*- coding: utf-8 -*-
+import os
+import numpy as np
+from joblib import Parallel, delayed
+from tqdm import tqdm
+import sys
+import torch
+#from transformers import BertTokenizer, BertModel
+#BertTokenizer.from_pretrained(".C:/Users/admin/.conda/envs/pytorch/bert-cache/bert-base-uncased")
+#BertModel.from_pretrained(".C:/Users/admin/.conda/envs/pytorch/bert-cache/bert-base-uncased")
+
+from transformers import BertTokenizer, BertModel
+
+local_path = r"G:\TRGCN\bert-cache\bert-base-uncased"
+tokenizer = BertTokenizer.from_pretrained(local_path)
+model = BertModel.from_pretrained(local_path)
+bert_tokenizer = None
+bert_model = None
+device = torch.device("cuda")
+
+def init_bert():
+    global bert_model, bert_tokenizer
+    if bert_model is None or bert_tokenizer is None:
+        model_name = "bert-base-uncased"
+        bert_tokenizer = BertTokenizer.from_pretrained(model_name, cache_dir="./bert-cache")
+        bert_model = BertModel.from_pretrained(model_name, cache_dir="./bert-cache")
+       
+        bert_model = bert_model.to_empty(device=device)
+        bert_model.eval()        
+        for name, param in bert_model.named_parameters():
+            if param.is_meta:
+                raise RuntimeError(f"模型参数 {name} 是 meta tensor，加载失败，请清空缓存重试")
+
+    return bert_model, bert_tokenizer
+
+
+def get_bert_features(texts):    
+    model, tokenizer = init_bert()
+    inputs = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=512,
+        return_tensors="pt"
+    ).to(device)
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+        cls_vectors = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+
+    return cls_vectors
+
+
+def load_text_mapping(text_file_path):    
+    text_mapping = {}
+    with open(text_file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) >= 2:
+                node_id = parts[0]
+                text = '\t'.join(parts[1:])
+                text_mapping[node_id] = text
+    return text_mapping
+
+
+cwd = os.getcwd()
+
+
+class Node_tweet(object):
+    def __init__(self, idx=None):
+        self.children = []
+        self.idx = idx
+        self.text = ""
+        self.parent = None
+        self.bert_feature = np.zeros((768,))  
+
+
+def constructMat(tree, text_mapping):
+    index2node = {}
+    texts = []
+
+    for i in tree:
+        node = Node_tweet(idx=i)
+        index2node[i] = node
+
+        node_id = f"{i}"
+        if node_id in text_mapping:
+            node.text = text_mapping[node_id]
+            texts.append(node.text)
+        else:
+            node.text = ""
+            texts.append("")
+    
+    bert_features = get_bert_features(texts) if len(texts) > 0 else []
+    
+    root_index = None
+    for j in tree:
+        indexC = j
+        indexP = tree[j]['parent']
+        nodeC = index2node[indexC]
+        
+        if isinstance(bert_features, np.ndarray) and bert_features.shape[0] == len(index2node):
+            node_idx = list(index2node.keys()).index(j)
+            nodeC.bert_feature = bert_features[node_idx]
+        else:
+            nodeC.bert_feature = np.zeros((768,))  
+
+        if indexP != 'None':
+            nodeP = index2node[int(indexP)]
+            nodeC.parent = nodeP
+            nodeP.children.append(nodeC)
+        else:
+            root_index = indexC - 1
+
+    bert_features_list = [index2node[i + 1].bert_feature for i in range(len(index2node))]
+
+    if root_index is not None and (root_index + 1) in index2node:
+        root_bert_feature = index2node[root_index + 1].bert_feature.reshape(1, -1)
+    else:
+        root_bert_feature = np.zeros((1, 768))
+
+    row, col = [], []
+    for index_i in range(len(index2node)):
+        for index_j in range(len(index2node)):
+            if index2node[index_i + 1].children and index2node[index_j + 1] in index2node[index_i + 1].children:
+                row.append(index_i)
+                col.append(index_j)
+
+    edgematrix = [row, col]
+    return bert_features_list, edgematrix, root_bert_feature, root_index
+
+
+def main(obj):
+    text_file_path = os.path.join('..', 'data/' + obj + '/source_tweets.txt')
+    text_mapping = load_text_mapping(text_file_path)
+
+    treePath = os.path.join('..', 'data/' + obj + '/data.TD_RvNN.vol_5000.txt')
+    print("reading twitter tree")
+    treeDic = {}
+    for line in open(treePath):
+        line = line.rstrip()
+        eid, indexP, indexC = line.split('\t')[0], line.split('\t')[1], int(line.split('\t')[2])
+        max_degree, maxL, Vec = int(line.split('\t')[3]), int(line.split('\t')[4]), line.split('\t')[5]
+
+        if eid not in treeDic:
+            treeDic[eid] = {}
+        treeDic[eid][indexC] = {'parent': indexP, 'max_degree': max_degree, 'maxL': maxL, 'vec': Vec}
+    print('tree no:', len(treeDic))
+
+    labelPath = os.path.join('..', "data/" + obj + "/" + obj + "_label_All.txt")
+    labelset_nonR, labelset_f, labelset_t, labelset_u = ['news', 'non-rumor'], ['false'], ['true'], ['unverified']
+
+    print("loading tree label")
+    event, y = [], []
+    l1 = l2 = l3 = l4 = 0
+    labelDic = {}
+    for line in open(labelPath):
+        line = line.rstrip()
+        label, eid = line.split('\t')[0], line.split('\t')[2]
+        label = label.lower()
+        event.append(eid)
+        if label in labelset_nonR:
+            labelDic[eid] = 0
+            l1 += 1
+        if label in labelset_f:
+            labelDic[eid] = 1
+            l2 += 1
+        if label in labelset_t:
+            labelDic[eid] = 2
+            l3 += 1
+        if label in labelset_u:
+            labelDic[eid] = 3
+            l4 += 1
+    print(len(labelDic))
+    print(l1, l2, l3, l4)
+
+    def loadEid(event, id, y, text_mapping):
+        if event is None or len(event) < 2:
+            return None
+
+        try:
+            bert_features, tree, rootfeat, rootindex = constructMat(event, text_mapping)
+        except Exception as e:
+            print(f"Error processing event {id}: {str(e)}")
+            return None
+
+        bert_features = np.array(bert_features)
+        tree = np.array(tree)
+        rootfeat = np.array(rootfeat)
+        rootindex = np.array([rootindex]) if rootindex is not None else np.array([-1])
+        y = np.array(y)
+
+        output_dir = os.path.join('..', 'data/' + obj + 'graph/')
+        os.makedirs(output_dir, exist_ok=True)
+        np.savez(
+            os.path.join(output_dir, f"{id}.npz"),
+            x=bert_features,
+            root=rootfeat,
+            edgeindex=tree,
+            rootindex=rootindex,
+            y=y
+        )
+        return None
+
+    print("loading dataset")
+    Parallel(n_jobs=1, backend='threading')(
+        delayed(loadEid)(treeDic[eid] if eid in treeDic else None, eid, labelDic[eid], text_mapping)
+        for eid in tqdm(event)
+    )
+
+
+if __name__ == '__main__':
+    obj = "Twitter16"
+    main(obj)
